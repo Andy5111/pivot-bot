@@ -1,16 +1,12 @@
 """
-Supply & Demand Zone Detector - SMART VERSION
-Based on Brad Goh (The Trading Geek) style – Pivot Method under the hood
-We look for strong moves (imbalance) and mark the origin candle 
-that started that move. That origin candle becomes the Supply or Demand zone.
-Now with trader thinking: Trend + Bias + Trade Plan
+Supply & Demand Zone Detector - SMART + TIMEFRAME VERSION
+Usage: /zones GOLD 15m  |  /zones GOLD 1h  |  /zones GOLD 4h  |  /zones GOLD 1d
 """
 from dataclasses import dataclass
 from typing import List
 import os
 import threading
 
-# --- Flask to keep Render Free Web Service alive ---
 from flask import Flask
 app = Flask(__name__)
 @app.route('/')
@@ -157,6 +153,29 @@ SYMBOLS = {
     "SPX500": "^GSPC",
 }
 
+# --- TIMEFRAMES YOU CAN CHOOSE ---
+# key: (yfinance interval, yfinance period, display name)
+TIMEFRAMES = {
+    "5M": ("5m", "2d", "5M"),
+    "5m": ("5m", "2d", "5M"),
+    "15M": ("15m", "5d", "15M"),
+    "15m": ("15m", "5d", "15M"),
+    "M15": ("15m", "5d", "15M"),
+    "30M": ("30m", "5d", "30M"),
+    "30m": ("30m", "5d", "30M"),
+    "1H": ("1h", "10d", "1H"),
+    "1h": ("1h", "10d", "1H"),
+    "H1": ("1h", "10d", "1H"),
+    "4H": ("1h", "1mo", "4H"),
+    "4h": ("1h", "1mo", "4H"),
+    "H4": ("1h", "1mo", "4H"),
+    "1D": ("1d", "3mo", "1D"),
+    "1d": ("1d", "3mo", "1D"),
+    "D1": ("1d", "3mo", "1D"),
+    "1W": ("1wk", "1y", "1W"),
+    "1w": ("1wk", "1y", "1W"),
+}
+
 def get_market_thinking(df, zones):
     df = normalize_df(df)
     close = df["close"]
@@ -184,7 +203,8 @@ def get_market_thinking(df, zones):
     for z in zones:
         if z.low <= current <= z.high:
             inside_zone = z
-        dist = min(abs(current - z.high), abs(current - z.low)) / current * 100
+        centre = (z.high + z.low) / 2
+        dist = abs(current - centre) / current * 100
         if dist < nearest_dist:
             nearest_dist = dist
             nearest = z
@@ -195,32 +215,47 @@ def get_market_thinking(df, zones):
         else:
             bias = "🔴 LOOK FOR SELLS - Price is INSIDE a Supply Zone"
             plan = f"Entry: Now / on bearish confirmation in zone\nStop Loss: Above {inside_zone.high:,.2f}\nTake Profit: Next Demand Zone below"
-    elif nearest and nearest.type == "demand" and current > nearest.high:
-        bias = "⏳ WAIT FOR PULLBACK TO BUY"
-        plan = f"Wait for price to drop to {nearest.low:,.2f} - {nearest.high:,.2f} ({nearest_dist:.2f}% away)\nDo NOT chase here.\nEntry: On retest + bullish candle\nStop Loss: Below {nearest.low:,.2f}"
-    elif nearest and nearest.type == "supply" and current < nearest.low:
-        bias = "⏳ WAIT FOR RALLY TO SELL"
-        plan = f"Wait for price to rise to {nearest.low:,.2f} - {nearest.high:,.2f} ({nearest_dist:.2f}% away)\nDo NOT chase here.\nEntry: On retest + bearish candle\nStop Loss: Above {nearest.high:,.2f}"
+    elif nearest and nearest.type == "demand":
+        if current > nearest.high:
+            bias = "⏳ WAIT FOR PULLBACK TO BUY"
+            plan = f"Wait for price to drop to {nearest.low:,.2f} - {nearest.high:,.2f} ({nearest_dist:.2f}% away)\nDo NOT chase here.\nEntry: On retest + bullish candle\nStop Loss: Below {nearest.low:,.2f}"
+        else:
+            bias = "👀 PRICE APPROACHING DEMAND FROM BELOW"
+            plan = f"Price is {nearest_dist:.2f}% below Demand {nearest.low:,.2f} - {nearest.high:,.2f}\nWait for price to ENTER the zone, then look for bullish bounce.\nIf it breaks below {nearest.low:,.2f} with force, zone is broken - do NOT buy."
+    elif nearest and nearest.type == "supply":
+        if current < nearest.low:
+            bias = "⏳ WAIT FOR RALLY TO SELL"
+            plan = f"Wait for price to rise to {nearest.low:,.2f} - {nearest.high:,.2f} ({nearest_dist:.2f}% away)\nDo NOT chase here.\nEntry: On retest + bearish candle\nStop Loss: Above {nearest.high:,.2f}"
+        else:
+            bias = "👀 PRICE APPROACHING SUPPLY FROM ABOVE"
+            plan = f"Price is {nearest_dist:.2f}% above Supply {nearest.low:,.2f} - {nearest.high:,.2f}\nWait for price to ENTER the zone, then look for bearish rejection.\nIf it breaks above {nearest.high:,.2f} with force, zone is broken - do NOT sell."
     else:
         bias = "🟡 NO CLEAR SETUP - WAIT"
         plan = "Price is far from any fresh zone. Patience is a trade."
     return trend, trend_note, bias, plan, nearest, nearest_dist, inside_zone
 
-def get_zones_text(symbol_key: str):
+def get_zones_text(symbol_key: str, tf_key: str = "1h"):
     ticker = SYMBOLS.get(symbol_key.upper())
     if not ticker:
         return f"Unknown symbol {symbol_key}. Try: /zones GOLD  or  /zones BTC"
+    tf = TIMEFRAMES.get(tf_key, TIMEFRAMES.get(tf_key.upper(), TIMEFRAMES["1h"]))
+    interval, period, display_tf = tf
     try:
-        df = yf.download(ticker, period="10d", interval="1h", progress=False, auto_adjust=False)
+        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
         if df is None or len(df) < 40:
-            return f"Not enough data for {symbol_key} right now. Try again in a minute."
+            return f"Not enough data for {symbol_key} on {display_tf} right now. Try again in a minute."
         df = normalize_df(df)
-        zones = detect_zones(df, symbol=symbol_key.upper(), timeframe="1H")
+        # For 4H, resample 1h candles into 4h candles
+        if display_tf == "4H":
+            df.index = pd.to_datetime(df.index)
+            df4 = df.resample("4h").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+            df = df4.reset_index(drop=True)
+        zones = detect_zones(df, symbol=symbol_key.upper(), timeframe=display_tf)
         if not zones:
-            return f"No high-quality zones found for {symbol_key} on 1H right now."
+            return f"No high-quality zones found for {symbol_key} on {display_tf} right now."
         current = float(df["close"].iloc[-1])
         trend, trend_note, bias, plan, nearest, nearest_dist, inside_zone = get_market_thinking(df, zones)
-        msg = f"🧠 {symbol_key.upper()} - 1H Smart Analysis\n"
+        msg = f"🧠 {symbol_key.upper()} - {display_tf} Smart Analysis\n"
         msg += f"Current Price: {current:,.2f}\n\n"
         msg += f"📈 TREND: {trend}\n{trend_note}\n\n"
         msg += f"🎯 BIAS: {bias}\n\n"
@@ -240,22 +275,25 @@ def get_zones_text(symbol_key: str):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to Pivot Zone Bot!\n\n"
-        "Commands:\n"
-        "/zones GOLD - Get Gold zones\n"
-        "/zones BTC - Get Bitcoin zones\n"
-        "/zones EURUSD - Get EURUSD zones\n"
-        "/zones GBPUSD - Get GBPUSD zones\n"
-        "/zones US30 - Get US30 zones\n\n"
-        "Timeframe: 1H | Method: Supply & Demand (Pivot Origin) + Smart Thinking"
+        "How to use:\n"
+        "/zones GOLD - Default 1H\n"
+        "/zones GOLD 15m - 15 minute zones\n"
+        "/zones GOLD 1h - 1 hour zones\n"
+        "/zones GOLD 4h - 4 hour zones\n"
+        "/zones GOLD 1d - Daily zones\n"
+        "/zones BTC 15m - Bitcoin 15m\n\n"
+        "Symbols: GOLD, BTC, EURUSD, GBPUSD, USDJPY, US30, NAS100, SPX500\n"
+        "Timeframes: 5m, 15m, 30m, 1h, 4h, 1d, 1w"
     )
 
 async def zones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /zones GOLD\nTry: GOLD, BTC, EURUSD, GBPUSD, US30, NAS100")
+        await update.message.reply_text("Usage: /zones GOLD 1h\nTry: /zones GOLD 15m  or  /zones BTC 4h")
         return
     symbol = context.args[0].upper()
-    await update.message.reply_text(f"🧠 Thinking about {symbol} on 1H... please wait")
-    text = get_zones_text(symbol)
+    tf = context.args[1] if len(context.args) > 1 else "1h"
+    await update.message.reply_text(f"🧠 Thinking about {symbol} on {tf.upper()}... please wait")
+    text = get_zones_text(symbol, tf)
     await update.message.reply_text(text)
 
 def main():
