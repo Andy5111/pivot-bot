@@ -1,5 +1,13 @@
 """
 FINAL BOT - TWELVE DATA VERSION - FAST, NEVER BLOCKS
++ 7 LOCKED IN CHANGES:
+1. Best Zone = Both Sides (Score = Conf - Dist*5)
+2. TP Never Empty (FVG -> Liquidity -> Round Number)
+3. One Distance Everywhere (Price to Entry Edge)
+4. Flip As Breakout Level (Ceiling / Floor)
+5. Two TPs (TP1 + TP2)
+6. Confluence Bonus (+10)
+7. New Organised Display
 """
 from dataclasses import dataclass
 from typing import List, Dict
@@ -117,8 +125,6 @@ def is_strong_down(df, start, atr):
         else: break
     return cnt >= 2 and total > 1.6 * atr.iloc[start]
 
-# --- CORRECTION #3: ZONES MUST NOT BE TOO CLOSE ---
-# Min gap between ANY two zones = 1.0 x ATR. If too close, keep higher Confidence only.
 def filter_overlapping_zones(zones, atr_val):
     if not zones: return []
     zones = sorted(zones, key=lambda z: z.confidence, reverse=True)
@@ -127,7 +133,6 @@ def filter_overlapping_zones(zones, atr_val):
     for z in zones:
         too_close = False
         for kept in filtered:
-            # Gap between zones: if they overlap or gap < min_gap, they are too close
             if z.low <= kept.high and kept.low <= z.high:
                 gap = 0
             elif z.low > kept.high:
@@ -241,29 +246,156 @@ def round_number_bonus(price, zone):
             return f"🎯 Round Number {rn:,.0f} in zone"
     return None
 
-# --- CORRECTION #1: ENTRY / SL / TP FROM ZONES (BRAD PIVOT) ---
-# BUY: Entry = Demand, SL = Below Demand, TP = Next Supply
-# SELL: Entry = Supply, SL = Above Supply, TP = Next Demand
-# No fake TP. R:R is info only.
-def calc_trade_plan(current, zone, zones, atr_val):
-    if zone.type == "demand":
-        entry = zone.high
-        sl = zone.low - atr_val * 0.2
-        risk = entry - sl
-        supplies = sorted([z for z in zones if z.type == "supply" and z.low > entry], key=lambda z: z.low)
-        tp = supplies[0].low if supplies else None
-        rr = (tp - entry) / risk if tp is not None and risk > 0 else 0
-        return entry, sl, tp, rr
-    else:
-        entry = zone.low
-        sl = zone.high + atr_val * 0.2
-        risk = sl - entry
-        demands = sorted([z for z in zones if z.type == "demand" and z.high < entry], key=lambda z: z.high, reverse=True)
-        tp = demands[0].high if demands else None
-        rr = (entry - tp) / risk if tp is not None and risk > 0 else 0
-        return entry, sl, tp, rr
+# ============ NEW HELPERS FOR 7 CHANGES ============
 
-# --- CORRECTION #2: CONFIDENCE IS THE BOSS ---
+# --- #3 ONE DISTANCE EVERYWHERE ---
+# Demand: Price to TOP (entry). Supply: Price to BOTTOM (entry). Inside: 0.
+def distance_to_entry(current, zone):
+    if zone.low <= current <= zone.high:
+        return 0.0
+    if zone.type == "demand":
+        return abs(current - zone.high) / current * 100
+    else:
+        return abs(current - zone.low) / current * 100
+
+def entry_edge(zone):
+    return zone.high if zone.type == "demand" else zone.low
+
+# --- #6 CONFLUENCE BONUS ---
+# +10 if at least 2 of: FVG inside zone, Round Number inside zone, HTF zone overlaps zone.
+def confluence_bonus(zone, fvgs, current, htf_zones):
+    hits = 0
+    labels = []
+    for f in (fvgs or []):
+        if not (f.high < zone.low or f.low > zone.high):
+            hits += 1; labels.append("FVG"); break
+    rn = round_number_bonus(current, zone)
+    if rn:
+        hits += 1; labels.append("Round Number")
+    for z4 in (htf_zones or []):
+        if not (z4.high < zone.low or z4.low > zone.high):
+            hits += 1; labels.append("4H Overlap"); break
+    if hits >= 2:
+        return 10.0, labels
+    return 0.0, labels
+
+# --- #1 BEST ZONE BOTH SIDES ---
+# Score = (Confidence + Confluence Bonus) - (Distance x 5). Inside = Distance 0, so it wins fairly.
+def pick_best_zone(zones, current, fvgs, htf_zones):
+    best = None; best_score = -9999; best_bonus = 0; best_labels = []
+    for z in zones:
+        bonus, labels = confluence_bonus(z, fvgs, current, htf_zones)
+        adj_conf = min(95.0, z.confidence + bonus)
+        dist = distance_to_entry(current, z)
+        score = adj_conf - (dist * 5)
+        if score > best_score:
+            best_score = score; best = z; best_bonus = bonus; best_labels = labels
+    return best, best_score, best_bonus, best_labels
+
+# --- #2 TP NEVER EMPTY + #5 TWO TPs ---
+# TP1 = Nearest FVG in trade direction, else nearest zone in direction, else Liquidity / Round Number
+# TP2 = Next opposite zone, else Liquidity / Round Number / ATR extension
+def calc_trade_plan(current, zone, zones, fvgs, liq_notes, atr_val):
+    is_buy = (zone.type == "demand")
+    entry = zone.high if is_buy else zone.low
+    sl = zone.low - atr_val * 0.2 if is_buy else zone.high + atr_val * 0.2
+    risk = abs(entry - sl) if abs(entry - sl) > 0 else atr_val * 0.5
+
+    # Parse liquidity levels from notes
+    liq_levels = []
+    for n in (liq_notes or []):
+        try:
+            # format: "💧 Liquidity above ~3,522.00 (Equal Highs)"
+            part = n.split("~")[1].split(" ")[0].replace(",", "")
+            liq_levels.append(float(part))
+        except: pass
+
+    def next_round_number(price, direction):
+        # Next 50 / 100 level in direction
+        if direction > 0:
+            for step in [50, 100]:
+                rn = (int(price // step) + 1) * step
+                if abs(rn - price) / price > 0.001:
+                    return float(rn)
+            return price * 1.01
+        else:
+            for step in [50, 100]:
+                rn = (int(price // step)) * step
+                if abs(rn - price) / price > 0.001:
+                    return float(rn)
+            return price * 0.99
+
+    # --- TP1 ---
+    tp1 = None; tp1_label = ""
+    if is_buy:
+        fvg_above = sorted([f for f in (fvgs or []) if f.type == "bullish" and f.low > entry], key=lambda f: f.low)
+        if fvg_above:
+            tp1 = fvg_above[0].low; tp1_label = "FVG"
+        else:
+            sup_above = sorted([z for z in zones if z.type == "supply" and z.low > entry], key=lambda z: z.low)
+            if sup_above:
+                tp1 = sup_above[0].low; tp1_label = "Next Supply"
+    else:
+        fvg_below = sorted([f for f in (fvgs or []) if f.type == "bearish" and f.high < entry], key=lambda f: f.high, reverse=True)
+        if fvg_below:
+            tp1 = fvg_below[0].high; tp1_label = "FVG"
+        else:
+            dem_below = sorted([z for z in zones if z.type == "demand" and z.high < entry], key=lambda z: z.high, reverse=True)
+            if dem_below:
+                tp1 = dem_below[0].high; tp1_label = "Next Demand"
+    if tp1 is None:
+        # Fallback: Liquidity in direction, else Round Number
+        if is_buy:
+            liq_above = [x for x in liq_levels if x > entry]
+            if liq_above:
+                tp1 = min(liq_above); tp1_label = "Liquidity"
+            else:
+                tp1 = next_round_number(entry, 1); tp1_label = "Round Number"
+        else:
+            liq_below = [x for x in liq_levels if x < entry]
+            if liq_below:
+                tp1 = max(liq_below); tp1_label = "Liquidity"
+            else:
+                tp1 = next_round_number(entry, -1); tp1_label = "Round Number"
+
+    # --- TP2 ---
+    tp2 = None; tp2_label = ""
+    if is_buy:
+        sup_above = sorted([z for z in zones if z.type == "supply" and z.low > entry], key=lambda z: z.low)
+        # If TP1 already used first supply, TP2 = second supply, else first supply
+        if tp1_label == "Next Supply" and len(sup_above) >= 2:
+            tp2 = sup_above[1].low; tp2_label = "Next Supply 2"
+        elif sup_above:
+            tp2 = sup_above[0].low; tp2_label = "Next Supply"
+        else:
+            liq_above = [x for x in liq_levels if x > entry and abs(x - tp1) / entry > 0.002]
+            if liq_above:
+                tp2 = min(liq_above); tp2_label = "Liquidity"
+            else:
+                tp2 = next_round_number(tp1, 1); tp2_label = "Round Number"
+    else:
+        dem_below = sorted([z for z in zones if z.type == "demand" and z.high < entry], key=lambda z: z.high, reverse=True)
+        if tp1_label == "Next Demand" and len(dem_below) >= 2:
+            tp2 = dem_below[1].high; tp2_label = "Next Demand 2"
+        elif dem_below:
+            tp2 = dem_below[0].high; tp2_label = "Next Demand"
+        else:
+            liq_below = [x for x in liq_levels if x < entry and abs(x - tp1) / entry > 0.002]
+            if liq_below:
+                tp2 = max(liq_below); tp2_label = "Liquidity"
+            else:
+                tp2 = next_round_number(tp1, -1); tp2_label = "Round Number"
+
+    # Safety: TP2 must be further than TP1
+    if is_buy and tp2 <= tp1:
+        tp2 = tp1 + max(atr_val * 0.5, abs(tp1 - entry) * 0.5); tp2_label = "ATR Extension"
+    if (not is_buy) and tp2 >= tp1:
+        tp2 = tp1 - max(atr_val * 0.5, abs(entry - tp1) * 0.5); tp2_label = "ATR Extension"
+
+    rr1 = abs(tp1 - entry) / risk if risk > 0 else 0
+    rr2 = abs(tp2 - entry) / risk if risk > 0 else 0
+    return entry, sl, tp1, tp1_label, tp2, tp2_label, rr1, rr2
+
 def confidence_verdict(conf):
     if conf >= 75:
         return "✅ HIGH Confidence - Take it"
@@ -271,7 +403,6 @@ def confidence_verdict(conf):
         return "⚠️ MEDIUM Confidence - Manage size"
     return "❌ LOW Confidence - Wait for better zone"
 
-# --- FAST DATA SOURCE: TWELVE DATA + YAHOO FALLBACK ---
 TWELVE_MAP = {"GC=F": "XAU/USD", "BTC-USD": "BTC/USD", "EURUSD=X": "EUR/USD", "GBPUSD=X": "GBP/USD", "USDJPY=X": "USD/JPY", "^DJI": "DJI", "^NDX": "NDX", "^GSPC": "SPX"}
 
 def fetch_df(ticker, tf_key):
@@ -318,33 +449,17 @@ def get_market_thinking(df, zones):
     elif current < ema50 < ema200: trend = "🔴 STRONG DOWNTREND"; note = "Below EMA50 < EMA200"
     elif current < ema50: trend = "🔴 DOWNTREND"; note = "Below EMA50"
     else: trend = "🟡 RANGING"; note = "Stuck at EMAs"
-    inside = None; demand_below = None; d_dist = 999999; supply_above = None; s_dist = 999999; nearest = None; nd = 999999
+    # NOTE: Best zone is now picked in build_analysis with scoring + confluence.
+    # This function kept for confluence + fallback bias only.
+    inside = None
     for z in zones:
         if z.low <= current <= z.high: inside = z
-        d = abs(current - (z.high + z.low) / 2) / current * 100
-        if d < nd: nd = d; nearest = z
-        if z.type == "demand" and z.high < current:
-            d2 = (current - z.high) / current * 100
-            if d2 < d_dist: d_dist = d2; demand_below = z
-        if z.type == "supply" and z.low > current:
-            d2 = (z.low - current) / current * 100
-            if d2 < s_dist: s_dist = d2; supply_above = z
-    actionable = inside; adist = 0 if inside else nd
-    if not actionable:
-        if is_down and supply_above: actionable = supply_above; adist = s_dist
-        elif is_up and demand_below: actionable = demand_below; adist = d_dist
-        else: actionable = nearest; adist = nd
     if inside:
         if inside.type == "demand": bias = "🟢 BUYS - INSIDE Demand"; plan = f"SL Below {inside.low:,.2f}"
         else: bias = "🔴 SELLS - INSIDE Supply"; plan = f"SL Above {inside.high:,.2f}"
-    elif actionable and actionable.type == "demand":
-        bias = "⏳ WAIT PULLBACK TO BUY" if current > actionable.high else "👀 APPROACHING DEMAND FROM BELOW"
-        plan = f"Wait {actionable.low:,.2f}-{actionable.high:,.2f} ({adist:.2f}% away)"
-    elif actionable and actionable.type == "supply":
-        bias = "⏳ WAIT RALLY TO SELL" if current < actionable.low else "👀 APPROACHING SUPPLY FROM ABOVE"
-        plan = f"Wait {actionable.low:,.2f}-{actionable.high:,.2f} ({adist:.2f}% away)"
-    else: bias = "🟡 NO SETUP"; plan = "Patience is a trade."
-    return trend, note, bias, plan, actionable, adist, inside
+    else:
+        bias = "🟡 NO SETUP"; plan = "Patience is a trade."
+    return trend, note, bias, plan, inside
 
 def build_analysis(symbol_key, tf_key):
     ticker = SYMBOLS.get(symbol_key.upper())
@@ -356,41 +471,115 @@ def build_analysis(symbol_key, tf_key):
     if not zones: return f"No high-quality zones for {symbol_key} on {display}"
     current = float(df["close"].iloc[-1])
     atr_val = float(calculate_atr(df).iloc[-1])
-    trend, note, bias, plan, best, best_dist, inside = get_market_thinking(df, zones)
     fvgs = detect_fvg(df); liq = detect_liquidity(df)
-    entry, sl, tp, rr = calc_trade_plan(current, best, zones, atr_val)
-    conf_verdict = confidence_verdict(best.confidence)
-    rn = round_number_bonus(current, best)
+
+    # HTF zones for Confluence Bonus + HTF Warning
+    htf_zones = []
     htf_warn = ""
     if tf_key == "1h":
         try:
             df4, _ = fetch_df(ticker, "4h")
             if df4 is not None:
-                zones4 = detect_zones(df4, symbol=symbol_key.upper(), timeframe="4H")
-                for z4 in zones4:
-                    if z4.type != best.type and z4.low <= (best.high + best.low) / 2 <= z4.high:
-                        htf_warn = f"\n⚠️ HTF WARNING: Your {best.type} zone is INSIDE a 4H {z4.type} zone {z4.low:,.2f}-{z4.high:,.2f} - Low probability!"
+                htf_zones = detect_zones(df4, symbol=symbol_key.upper(), timeframe="4H")
         except: pass
-    JOURNAL.append({"symbol": symbol_key.upper(), "tf": display, "bias": bias, "price": current, "best": f"{best.low:,.2f}-{best.high:,.2f}", "conf": round(best.confidence), "rr": round(rr, 2), "time": datetime.datetime.utcnow().strftime("%H:%M")})
-    if len(JOURNAL) > 20: JOURNAL.pop(0)
-    tp_text = f"{tp:,.2f}" if tp is not None else "No opposite zone yet"
-    msg = f"🧠 {symbol_key.upper()} - {display} PRO Analysis\nPrice: {current:,.2f} | Session: {get_session()}\n\n📈 TREND: {trend}\n{note}\n\n🎯 BIAS: {bias}\n📋 {plan}\n\n🏆 BEST ZONE: {'🟢 DEMAND' if best.type == 'demand' else '🔴 SUPPLY'} {best.low:,.2f} - {best.high:,.2f} | {best.confidence:.0f}% | {'🆕 FRESH' if best.is_fresh else f'Tested {best.tested}x'} {'| 🔄 FLIP' if best.is_flip else ''} | {best_dist:.2f}% away{htf_warn}\n"
-    if rn: msg += f"{rn}\n"
-    msg += f"\n💰 TRADE PLAN:\nEntry: {entry:,.2f}\nSL: {sl:,.2f}\nTP: {tp_text} (Next {'Supply' if best.type == 'demand' else 'Demand'})\nR:R (info only): 1:{rr:.1f}\n{conf_verdict}\n"
-    if fvgs:
-        msg += "\n⚡ FVG:\n"
-        for f in fvgs: msg += f"{'🟢 Bullish' if f.type == 'bullish' else '🔴 Bearish'} {f.low:,.2f} - {f.high:,.2f}\n"
-    if liq: msg += f"\n{chr(10).join(liq)}\n"
-    msg += "\n--- ALL ZONES ---\n"
+
+    # --- #1 + #6: Pick Best Zone with Score + Confluence ---
+    best, best_score, best_bonus, best_labels = pick_best_zone(zones, current, fvgs, htf_zones)
+    best_conf = min(95.0, best.confidence + best_bonus)
+    best_dist = distance_to_entry(current, best)  # #3 One Distance
+
+    # Trend / Bias
+    trend, note, _, _, inside = get_market_thinking(df, zones)
+    if inside is not None and inside == best:
+        if best.type == "demand": bias = "🟢 BUYS - INSIDE Demand"; plan = f"Entry now - SL Below {best.low:,.2f}"
+        else: bias = "🔴 SELLS - INSIDE Supply"; plan = f"Entry now - SL Above {best.high:,.2f}"
+    elif best.type == "demand":
+        if current > best.high:
+            bias = "⏳ WAIT PULLBACK TO BUY"; plan = f"Wait {best.low:,.2f}-{best.high:,.2f} ({best_dist:.2f}% away)"
+        else:
+            bias = "👀 APPROACHING DEMAND FROM BELOW"; plan = f"Demand below? Actually above - Breakout watch {best.high:,.2f}"
+    else:
+        if current < best.low:
+            bias = "⏳ WAIT RALLY TO SELL"; plan = f"Wait {best.low:,.2f}-{best.high:,.2f} ({best_dist:.2f}% away)"
+        else:
+            bias = "👀 APPROACHING SUPPLY FROM ABOVE"; plan = f"Supply above? Actually below - Breakdown watch {best.low:,.2f}"
+
+    # --- #4 FLIP AS BREAKOUT LEVEL ---
+    # Find ceiling (Demand above) and floor (Supply below) that are NOT the best zone
+    breakout_line = ""
     for z in zones:
-        emoji = "🟢 DEMAND" if z.type == "demand" else "🔴 SUPPLY"
-        dist = abs(current - (z.high + z.low) / 2) / current * 100
-        fresh = "🆕 FRESH" if z.is_fresh else f"Tested {z.tested}x"
-        flip = " | 🔄 FLIP" if z.is_flip else ""
+        if z == best: continue
+        if z.type == "demand" and z.low > current:
+            breakout_line = f"👀 ALSO WATCH: Break above {z.high:,.2f} = Breakout BUY (Demand Ceiling {z.low:,.2f}-{z.high:,.2f})"
+            break
+        if z.type == "supply" and z.high < current:
+            breakout_line = f"👀 ALSO WATCH: Break below {z.low:,.2f} = Breakdown SELL (Supply Floor {z.low:,.2f}-{z.high:,.2f})"
+            break
+    # If best itself is a flip/breakout zone, label it
+    if best.type == "demand" and best.low > current:
+        breakout_line = f"🔺 DEMAND ABOVE = CEILING - Break above {best.high:,.2f} = BUY breakout"
+    if best.type == "supply" and best.high < current:
+        breakout_line = f"🔻 SUPPLY BELOW = FLOOR - Break below {best.low:,.2f} = SELL breakdown"
+
+    # HTF Warning using best zone middle
+    if htf_zones:
+        for z4 in htf_zones:
+            if z4.type != best.type and z4.low <= (best.high + best.low) / 2 <= z4.high:
+                htf_warn = f"\n⚠️ HTF WARNING: Your {best.type} zone is INSIDE a 4H {z4.type} zone {z4.low:,.2f}-{z4.high:,.2f} - Low probability!"
+
+    # --- #2 + #5: Two TPs, Never Empty ---
+    entry, sl, tp1, tp1_label, tp2, tp2_label, rr1, rr2 = calc_trade_plan(current, best, zones, fvgs, liq, atr_val)
+    conf_verdict = confidence_verdict(best_conf)
+    rn = round_number_bonus(current, best)
+
+    JOURNAL.append({"symbol": symbol_key.upper(), "tf": display, "bias": bias, "price": current, "best": f"{best.low:,.2f}-{best.high:,.2f}", "conf": round(best_conf), "rr": round(rr2, 2), "time": datetime.datetime.utcnow().strftime("%H:%M")})
+    if len(JOURNAL) > 20: JOURNAL.pop(0)
+
+    # --- #7 NEW ORGANISED DISPLAY ---
+    trend_emoji = "🟢" if "UPTREND" in trend else ("🔴" if "DOWNTREND" in trend else "🟡")
+    line = "━━━━━━━━━━━━━━━━━━"
+    msg = f"🧠 {symbol_key.upper()} | {display} | {trend_emoji} {trend}\n"
+    msg += f"💰 Price: {current:,.2f} | {get_session()}\n"
+    msg += f"{line}\n\n"
+    msg += f"🎯 BIAS\n{bias}\n📋 {plan}\n"
+    if breakout_line:
+        msg += f"{breakout_line}\n"
+    msg += f"\n{line}\n"
+    msg += f"🏆 BEST ZONE\n"
+    msg += f"{'🟢 DEMAND' if best.type == 'demand' else '🔴 SUPPLY'} {best.low:,.2f} - {best.high:,.2f}\n"
+    msg += f"⭐ {best_conf:.0f}% | {'🆕 FRESH' if best.is_fresh else f'Tested {best.tested}x'} | {best_dist:.2f}% away"
+    if best.is_flip: msg += " | 🔄 FLIP"
+    msg += "\n"
+    if best_bonus > 0:
+        msg += f"✨ Confluence +{best_bonus:.0f} ({' + '.join(best_labels)})\n"
+    if rn: msg += f"{rn}\n"
+    if htf_warn: msg += f"{htf_warn}\n"
+    msg += f"\n{line}\n"
+    msg += f"💰 TRADE PLAN\n"
+    msg += f"Entry: {entry:,.2f}\n"
+    sl_pct = abs(entry - sl) / entry * 100 if entry else 0
+    msg += f"SL:    {sl:,.2f}  (-{sl_pct:.2f}%)\n"
+    msg += f"TP1:   {tp1:,.2f}  (+{abs(tp1-entry)/entry*100:.2f}%) ← {tp1_label} - Take partial, SL to BE\n"
+    msg += f"TP2:   {tp2:,.2f}  (+{abs(tp2-entry)/entry*100:.2f}%) ← {tp2_label} - Let rest run\n"
+    msg += f"R:R TP1 = 1:{rr1:.1f} | TP2 = 1:{rr2:.1f}\n"
+    msg += f"Ver:   {conf_verdict}\n"
+    msg += f"\n{line}\n"
+    msg += f"⚡ FVG / 💧 LIQUIDITY\n"
+    if fvgs:
+        for f in fvgs: msg += f"{'🟢 Bullish' if f.type == 'bullish' else '🔴 Bearish'} {f.low:,.2f} - {f.high:,.2f}\n"
+    else:
+        msg += "No recent FVG\n"
+    if liq: msg += f"{chr(10).join(liq)}\n"
+    msg += f"\n{line}\n"
+    msg += f"📋 ALL ZONES\n"
+    for z in zones:
+        emoji = "🟢" if z.type == "demand" else "🔴"
+        dist = distance_to_entry(current, z)  # #3 same distance everywhere
         tag = " ← PRICE HERE" if inside == z else ""
         star = " ⭐ BEST" if z == best else ""
-        msg += f"{emoji} {z.low:,.2f}-{z.high:,.2f} | {z.confidence:.0f}% | {fresh}{flip} | {dist:.2f}% away{tag}{star}\n"
-    msg += "\n⚠️ Not financial advice. No trade 30min before NFP / CPI / FOMC."
+        msg += f"{emoji} {z.low:,.2f}-{z.high:,.2f} | {min(95.0, z.confidence + confluence_bonus(z, fvgs, current, htf_zones)[0]):.0f}% | {dist:.2f}% away{tag}{star}\n"
+    msg += f"\n{line}\n"
+    msg += "⚠️ Not financial advice. No trade 30min before NFP / CPI / FOMC."
     return msg
 
 def get_confluence(symbol_key):
@@ -401,8 +590,12 @@ def get_confluence(symbol_key):
         if df is None: continue
         zones = detect_zones(df, symbol=symbol_key.upper(), timeframe=disp)
         if not zones: continue
-        trend, _, bias, _, best, _, _ = get_market_thinking(df, zones)
-        results[tf] = (trend, bias, best)
+        trend, _, bias, _, _ = get_market_thinking(df, zones)
+        # Best for confluence: use scoring with no HTF for speed
+        fvgs_tmp = detect_fvg(df)
+        cur_tmp = float(df["close"].iloc[-1])
+        best_tmp, _, _, _ = pick_best_zone(zones, cur_tmp, fvgs_tmp, [])
+        results[tf] = (trend, bias, best_tmp)
     if not results: return "No data - Try again"
     bull = sum(1 for v in results.values() if "UPTREND" in v[0] or "BUY" in v[1])
     bear = sum(1 for v in results.values() if "DOWNTREND" in v[0] or "SELL" in v[1])
