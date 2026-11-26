@@ -1,5 +1,5 @@
 """
-FINAL BOT - TWELVE DATA VERSION - FAST, NEVER BLOCKS - FIXED
+FINAL BOT - TWELVE DATA VERSION - FAST, NEVER BLOCKS
 """
 from dataclasses import dataclass
 from typing import List, Dict
@@ -48,7 +48,7 @@ class FVG:
     index: int
 
 ALERTS: Dict[int, List[dict]] = {}
-JOURNAL: List[dict] = []
+JOURNAL: List[dict] = {}
 USER_STATE: Dict[int, str] = {}
 
 SYMBOLS = {
@@ -117,17 +117,28 @@ def is_strong_down(df, start, atr):
         else: break
     return cnt >= 2 and total > 1.6 * atr.iloc[start]
 
+# --- CORRECTION #3: ZONES MUST NOT BE TOO CLOSE ---
+# Min gap between ANY two zones = 1.0 x ATR. If too close, keep higher Confidence only.
 def filter_overlapping_zones(zones, atr_val):
     if not zones: return []
     zones = sorted(zones, key=lambda z: z.confidence, reverse=True)
     filtered = []
-    tol = 0.25 * atr_val if atr_val else 0
+    min_gap = 1.0 * atr_val if atr_val else 0
     for z in zones:
-        overlap = False
+        too_close = False
         for kept in filtered:
-            if not (z.high < kept.low - tol or z.low > kept.high + tol):
-                overlap = True; break
-        if not overlap: filtered.append(z)
+            # Gap between zones: if they overlap or gap < min_gap, they are too close
+            if z.low <= kept.high and kept.low <= z.high:
+                gap = 0
+            elif z.low > kept.high:
+                gap = z.low - kept.high
+            else:
+                gap = kept.low - z.high
+            if gap < min_gap:
+                too_close = True
+                break
+        if not too_close:
+            filtered.append(z)
     return filtered
 
 def detect_zones(df, symbol="UNKNOWN", timeframe="1H", lookback=120, min_confidence=55.0):
@@ -230,20 +241,37 @@ def round_number_bonus(price, zone):
             return f"🎯 Round Number {rn:,.0f} in zone"
     return None
 
-def calc_rr(current, zone, zones, atr_val):
+# --- CORRECTION #1: ENTRY / SL / TP FROM ZONES (BRAD PIVOT) ---
+# BUY: Entry = Demand, SL = Below Demand, TP = Next Supply
+# SELL: Entry = Supply, SL = Above Supply, TP = Next Demand
+# No fake TP. R:R is info only.
+def calc_trade_plan(current, zone, zones, atr_val):
     if zone.type == "demand":
-        entry = zone.high; sl = zone.low - atr_val * 0.2; risk = entry - sl
-        tps = [z.low for z in zones if z.type == "supply" and z.low > current]
-        tp = min(tps) if tps else entry + risk * 3
-        rr = (tp - entry) / risk if risk > 0 else 0
+        entry = zone.high
+        sl = zone.low - atr_val * 0.2
+        risk = entry - sl
+        supplies = sorted([z for z in zones if z.type == "supply" and z.low > entry], key=lambda z: z.low)
+        tp = supplies[0].low if supplies else None
+        rr = (tp - entry) / risk if tp is not None and risk > 0 else 0
         return entry, sl, tp, rr
     else:
-        entry = zone.low; sl = zone.high + atr_val * 0.2; risk = sl - entry
-        tps = [z.high for z in zones if z.type == "demand" and z.high < current]
-        tp = max(tps) if tps else entry - risk * 3
-        rr = (entry - tp) / risk if risk > 0 else 0
+        entry = zone.low
+        sl = zone.high + atr_val * 0.2
+        risk = sl - entry
+        demands = sorted([z for z in zones if z.type == "demand" and z.high < entry], key=lambda z: z.high, reverse=True)
+        tp = demands[0].high if demands else None
+        rr = (entry - tp) / risk if tp is not None and risk > 0 else 0
         return entry, sl, tp, rr
 
+# --- CORRECTION #2: CONFIDENCE IS THE BOSS ---
+def confidence_verdict(conf):
+    if conf >= 75:
+        return "✅ HIGH Confidence - Take it"
+    if conf >= 65:
+        return "⚠️ MEDIUM Confidence - Manage size"
+    return "❌ LOW Confidence - Wait for better zone"
+
+# --- FAST DATA SOURCE: TWELVE DATA + YAHOO FALLBACK ---
 TWELVE_MAP = {"GC=F": "XAU/USD", "BTC-USD": "BTC/USD", "EURUSD=X": "EUR/USD", "GBPUSD=X": "GBP/USD", "USDJPY=X": "USD/JPY", "^DJI": "DJI", "^NDX": "NDX", "^GSPC": "SPX"}
 
 def fetch_df(ticker, tf_key):
@@ -330,8 +358,8 @@ def build_analysis(symbol_key, tf_key):
     atr_val = float(calculate_atr(df).iloc[-1])
     trend, note, bias, plan, best, best_dist, inside = get_market_thinking(df, zones)
     fvgs = detect_fvg(df); liq = detect_liquidity(df)
-    entry, sl, tp, rr = calc_rr(current, best, zones, atr_val)
-    rr_verdict = "✅ TAKE IT - R:R >= 1:2" if rr >= 2 else "❌ SKIP - R:R too low"
+    entry, sl, tp, rr = calc_trade_plan(current, best, zones, atr_val)
+    conf_verdict = confidence_verdict(best.confidence)
     rn = round_number_bonus(current, best)
     htf_warn = ""
     if tf_key == "1h":
@@ -343,11 +371,12 @@ def build_analysis(symbol_key, tf_key):
                     if z4.type != best.type and z4.low <= (best.high + best.low) / 2 <= z4.high:
                         htf_warn = f"\n⚠️ HTF WARNING: Your {best.type} zone is INSIDE a 4H {z4.type} zone {z4.low:,.2f}-{z4.high:,.2f} - Low probability!"
         except: pass
-    JOURNAL.append({"symbol": symbol_key.upper(), "tf": display, "bias": bias, "price": current, "best": f"{best.low:,.2f}-{best.high:,.2f}", "rr": round(rr, 2), "time": datetime.datetime.utcnow().strftime("%H:%M")})
+    JOURNAL.append({"symbol": symbol_key.upper(), "tf": display, "bias": bias, "price": current, "best": f"{best.low:,.2f}-{best.high:,.2f}", "conf": round(best.confidence), "rr": round(rr, 2), "time": datetime.datetime.utcnow().strftime("%H:%M")})
     if len(JOURNAL) > 20: JOURNAL.pop(0)
+    tp_text = f"{tp:,.2f}" if tp is not None else "No opposite zone yet"
     msg = f"🧠 {symbol_key.upper()} - {display} PRO Analysis\nPrice: {current:,.2f} | Session: {get_session()}\n\n📈 TREND: {trend}\n{note}\n\n🎯 BIAS: {bias}\n📋 {plan}\n\n🏆 BEST ZONE: {'🟢 DEMAND' if best.type == 'demand' else '🔴 SUPPLY'} {best.low:,.2f} - {best.high:,.2f} | {best.confidence:.0f}% | {'🆕 FRESH' if best.is_fresh else f'Tested {best.tested}x'} {'| 🔄 FLIP' if best.is_flip else ''} | {best_dist:.2f}% away{htf_warn}\n"
     if rn: msg += f"{rn}\n"
-    msg += f"\n💰 TRADE MATH:\nEntry: {entry:,.2f}\nSL: {sl:,.2f}\nTP: {tp:,.2f}\nR:R = 1:{rr:.1f}\n{rr_verdict}\n"
+    msg += f"\n💰 TRADE PLAN:\nEntry: {entry:,.2f}\nSL: {sl:,.2f}\nTP: {tp_text} (Next {'Supply' if best.type == 'demand' else 'Demand'})\nR:R (info only): 1:{rr:.1f}\n{conf_verdict}\n"
     if fvgs:
         msg += "\n⚡ FVG:\n"
         for f in fvgs: msg += f"{'🟢 Bullish' if f.type == 'bullish' else '🔴 Bearish'} {f.low:,.2f} - {f.high:,.2f}\n"
@@ -424,8 +453,8 @@ async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📓 No trades yet. Tap GOLD -> 1h first.", reply_markup=main_keyboard()); return
     msg = "📓 JOURNAL:\n\n"
     for j in JOURNAL[-10:]:
-        msg += f"{j['time']} | {j['symbol']} {j['tf']} | {j['bias'][:30]} | {j['price']:,.2f} | R:R 1:{j['rr']}\n"
-    msg += f"\n✅ Good R:R: {sum(1 for j in JOURNAL if j['rr'] >= 2)}/{len(JOURNAL)}"
+        msg += f"{j['time']} | {j['symbol']} {j['tf']} | {j['bias'][:30]} | {j['price']:,.2f} | Conf {j['conf']}% | R:R 1:{j['rr']}\n"
+    msg += f"\n✅ High Confidence: {sum(1 for j in JOURNAL if j['conf'] >= 75)}/{len(JOURNAL)}"
     await update.message.reply_text(msg, reply_markup=main_keyboard())
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -452,7 +481,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=uid, text="📓 No trades yet.", reply_markup=main_keyboard()); return
             msg = "📓 JOURNAL:\n\n"
             for j in JOURNAL[-10:]:
-                msg += f"{j['time']} | {j['symbol']} {j['tf']} | {j['bias'][:30]} | R:R 1:{j['rr']}\n"
+                msg += f"{j['time']} | {j['symbol']} {j['tf']} | {j['bias'][:30]} | Conf {j['conf']}%\n"
             await context.bot.send_message(chat_id=uid, text=msg, reply_markup=main_keyboard()); return
         if data == "action:alert_help":
             await context.bot.send_message(chat_id=uid, text=f"Type:\n/alert {sym} 3511", reply_markup=main_keyboard()); return
