@@ -1,5 +1,5 @@
 """
-FINAL BOT - TWELVE DATA VERSION - FAST, NEVER BLOCKS
+FINAL BOT - TWELVE DATA VERSION - FAST, NEVER BLOCKS - FIXED
 """
 from dataclasses import dataclass
 from typing import List, Dict
@@ -48,7 +48,7 @@ class FVG:
     index: int
 
 ALERTS: Dict[int, List[dict]] = {}
-JOURNAL: List[dict] = {}
+JOURNAL: List[dict] = []
 USER_STATE: Dict[int, str] = {}
 
 SYMBOLS = {
@@ -244,12 +244,10 @@ def calc_rr(current, zone, zones, atr_val):
         rr = (entry - tp) / risk if risk > 0 else 0
         return entry, sl, tp, rr
 
-# --- FAST DATA SOURCE: TWELVE DATA + YAHOO FALLBACK ---
 TWELVE_MAP = {"GC=F": "XAU/USD", "BTC-USD": "BTC/USD", "EURUSD=X": "EUR/USD", "GBPUSD=X": "GBP/USD", "USDJPY=X": "USD/JPY", "^DJI": "DJI", "^NDX": "NDX", "^GSPC": "SPX"}
 
 def fetch_df(ticker, tf_key):
     _, _, display = TIMEFRAMES[tf_key]
-    # Try Twelve Data first - fast, never blocks
     if TWELVE_KEY:
         try:
             symbol = TWELVE_MAP.get(ticker, ticker)
@@ -264,16 +262,10 @@ def fetch_df(ticker, tf_key):
                     df[c] = df[c].astype(float)
                 df = df.iloc[::-1].reset_index(drop=True)
                 if len(df) >= 40:
-                    # Build 4H from 1h if needed
-                    if display == "4H":
-                        df = df.resample("4h", on=pd.to_datetime(df["date"]) if "date" in df else None) if False else df
-                        # Twelve already gives 4h, so just return
-                        pass
                     return normalize_df(df), display
             print(f"Twelve error: {r}")
         except Exception as e:
             print(f"Twelve failed: {e}")
-    # Fallback to Yahoo
     try:
         interval, period, _ = TIMEFRAMES[tf_key]
         df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
