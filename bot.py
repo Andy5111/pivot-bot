@@ -1,6 +1,8 @@
 """
-PIVOT ZONE BOT - PRO + BUTTONS TOGETHER
-Buttons: Symbols row + Timeframes row + Actions row, all in one keyboard
+PIVOT ZONE BOT - FINAL CLEAN VERSION
+Fixes: Nearest Zone + Timeframe Choice + BEST Zone + Buttons Together + No Ghost Messages
+Commands: /start | /zones GOLD 1h | /zones GOLD all | /alert GOLD 3511 | /alerts | /score
+Buttons: Tap Symbol -> Tap Timeframe -> Get Analysis
 """
 from dataclasses import dataclass
 from typing import List, Dict
@@ -10,7 +12,7 @@ from flask import Flask
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "Bot is running!"
+    return "Bot is running - FINAL!"
 def run_web():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 threading.Thread(target=run_web, daemon=True).start()
@@ -46,8 +48,9 @@ class FVG:
 
 ALERTS: Dict[int, List[dict]] = {}
 JOURNAL: List[dict] = {}
-# Remember last symbol user picked, so timeframe buttons work
 USER_STATE: Dict[int, str] = {}
+# Prevent double-processing same button tap
+PROCESSED = set()
 
 SYMBOLS = {
     "GOLD": "GC=F", "XAUUSD": "GC=F", "XAU": "GC=F",
@@ -65,30 +68,21 @@ def norm_tf(t):
     t = t.lower().replace("m15","15m").replace("h1","1h").replace("h4","4h").replace("d1","1d")
     return t if t in TIMEFRAMES else "1h"
 
-# --- BUTTONS TOGETHER - ONE KEYBOARD ---
 def main_keyboard(selected_symbol="GOLD"):
+    # ALL BUTTONS TOGETHER - ONE KEYBOARD, 3 ROWS
     return InlineKeyboardMarkup([
-        # Row 1: Symbols - TOGETHER
-        [
-            InlineKeyboardButton("🥇 GOLD", callback_data="sym:GOLD"),
-            InlineKeyboardButton("₿ BTC", callback_data="sym:BTC"),
-            InlineKeyboardButton("💶 EURUSD", callback_data="sym:EURUSD"),
-            InlineKeyboardButton("💷 GBPUSD", callback_data="sym:GBPUSD"),
-        ],
-        # Row 2: Timeframes - TOGETHER
-        [
-            InlineKeyboardButton("15m", callback_data=f"tf:15m"),
-            InlineKeyboardButton("1h", callback_data=f"tf:1h"),
-            InlineKeyboardButton("4h", callback_data=f"tf:4h"),
-            InlineKeyboardButton("1d", callback_data=f"tf:1d"),
-            InlineKeyboardButton("🌐 ALL", callback_data=f"tf:all"),
-        ],
-        # Row 3: Actions - TOGETHER
-        [
-            InlineKeyboardButton("🔔 Set Alert", callback_data="action:alert_help"),
-            InlineKeyboardButton("📓 Score", callback_data="action:score"),
-            InlineKeyboardButton("🔄 Refresh", callback_data="action:refresh"),
-        ],
+        [InlineKeyboardButton("🥇 GOLD", callback_data="sym:GOLD"),
+         InlineKeyboardButton("₿ BTC", callback_data="sym:BTC"),
+         InlineKeyboardButton("💶 EURUSD", callback_data="sym:EURUSD"),
+         InlineKeyboardButton("💷 GBPUSD", callback_data="sym:GBPUSD")],
+        [InlineKeyboardButton("15m", callback_data="tf:15m"),
+         InlineKeyboardButton("1h", callback_data="tf:1h"),
+         InlineKeyboardButton("4h", callback_data="tf:4h"),
+         InlineKeyboardButton("1d", callback_data="tf:1d"),
+         InlineKeyboardButton("🌐 ALL", callback_data="tf:all")],
+        [InlineKeyboardButton("🔔 Set Alert", callback_data="action:alert_help"),
+         InlineKeyboardButton("📓 Score", callback_data="action:score"),
+         InlineKeyboardButton("🔄 Refresh 1h", callback_data="action:refresh")],
     ])
 
 def normalize_df(df):
@@ -212,7 +206,7 @@ def get_session():
 
 def round_number_bonus(price, zone):
     for rn in [round(price/100)*100, round(price/50)*50]:
-        if zone.low- (price*0.005) <= rn <= zone.high + (price*0.005):
+        if zone.low-(price*0.005) <= rn <= zone.high+(price*0.005):
             return f"🎯 Round Number {rn:,.0f} inside zone - MAGNET"
     return None
 
@@ -241,6 +235,7 @@ def fetch_df(ticker, tf_key):
     return df, display
 
 def get_market_thinking(df, zones):
+    # FIX 1 + FIX 3 TOGETHER: Actionable zone logic
     df=normalize_df(df); close=df["close"]; current=float(close.iloc[-1])
     ema50=float(close.ewm(span=50).mean().iloc[-1])
     ema200=float(close.ewm(span=200).mean().iloc[-1]) if len(close)>=200 else ema50
@@ -251,6 +246,7 @@ def get_market_thinking(df, zones):
     elif current<ema50<ema200: trend="🔴 STRONG DOWNTREND"; note="Price below EMA50 below EMA200. Sellers in control."
     elif current<ema50: trend="🔴 DOWNTREND"; note="Price below EMA50. Lean bearish."
     else: trend="🟡 RANGING"; note="Price stuck around EMAs. Wait for breakout."
+
     inside=None; demand_below=None; demand_dist=999999; supply_above=None; supply_dist=999999; nearest=None; nd=999999
     for z in zones:
         if z.low<=current<=z.high: inside=z
@@ -262,20 +258,23 @@ def get_market_thinking(df, zones):
         if z.type=="supply" and z.low > current:
             d2=(z.low-current)/current*100
             if d2<supply_dist: supply_dist=d2; supply_above=z
+
+    # BEST = Inside > Trend-direction nearest > Nearest overall. NEVER far high-confidence.
     actionable = inside; actionable_dist = 0 if inside else nd
     if not actionable:
         if is_downtrend and supply_above: actionable=supply_above; actionable_dist=supply_dist
         elif is_uptrend and demand_below: actionable=demand_below; actionable_dist=demand_dist
         else: actionable=nearest; actionable_dist=nd
+
     if inside:
         if inside.type=="demand": bias="🟢 LOOK FOR BUYS - INSIDE Demand"; plan=f"Entry: On bullish confirmation\nSL: Below {inside.low:,.2f}"
         else: bias="🔴 LOOK FOR SELLS - INSIDE Supply"; plan=f"Entry: On bearish confirmation\nSL: Above {inside.high:,.2f}"
     elif actionable and actionable.type=="demand":
         if current>actionable.high: bias="⏳ WAIT FOR PULLBACK TO BUY"; plan=f"Wait drop to {actionable.low:,.2f}-{actionable.high:,.2f} ({actionable_dist:.2f}% away)"
-        else: bias="👀 APPROACHING DEMAND FROM BELOW"; plan=f"Wait ENTER zone {actionable.low:,.2f}-{actionable.high:,.2f}, then bounce. Break below = broken."
+        else: bias="👀 APPROACHING DEMAND FROM BELOW"; plan=f"Price {actionable_dist:.2f}% below Demand {actionable.low:,.2f}-{actionable.high:,.2f}. Wait ENTER zone, then bounce. Break below = broken."
     elif actionable and actionable.type=="supply":
         if current<actionable.low: bias="⏳ WAIT FOR RALLY TO SELL"; plan=f"Wait rise to {actionable.low:,.2f}-{actionable.high:,.2f} ({actionable_dist:.2f}% away)"
-        else: bias="👀 APPROACHING SUPPLY FROM ABOVE"; plan=f"Wait ENTER zone {actionable.low:,.2f}-{actionable.high:,.2f}, then rejection. Break above = broken."
+        else: bias="👀 APPROACHING SUPPLY FROM ABOVE"; plan=f"Price {actionable_dist:.2f}% above Supply {actionable.low:,.2f}-{actionable.high:,.2f}. Wait ENTER zone, then rejection. Break above = broken."
     else: bias="🟡 NO CLEAR SETUP"; plan="Patience is a trade."
     return trend, note, bias, plan, actionable, actionable_dist, inside
 
@@ -351,14 +350,12 @@ def get_confluence(symbol_key):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_STATE[update.effective_user.id]="GOLD"
     await update.message.reply_text(
-        "👋 PRO Pivot Zone Bot - Tap a button below!\n\n"
-        "1️⃣ Pick a Symbol (Row 1)\n"
-        "2️⃣ Pick a Timeframe (Row 2)\n"
-        "All buttons are together in one place 👇",
+        "👋 PRO Pivot Zone Bot - FINAL VERSION\n\n1️⃣ Pick Symbol (Row 1)\n2️⃣ Pick Timeframe (Row 2)\nAll buttons together below 👇",
         reply_markup=main_keyboard()
     )
 
 async def zones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # FIX: /zones with no args must NOT guess 4H, must show buttons
     if not context.args:
         await update.message.reply_text("Tap a button 👇", reply_markup=main_keyboard())
         return
@@ -393,7 +390,10 @@ async def alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, reply_markup=main_keyboard())
 
 async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not JOURNAL: await update.message.reply_text("No trades logged yet. Use buttons first.", reply_markup=main_keyboard()); return
+    # FIX: /score must NEVER trigger zone analysis
+    if not JOURNAL:
+        await update.message.reply_text("📓 No trades logged yet. Tap GOLD -> 1h first.", reply_markup=main_keyboard())
+        return
     msg="📓 JOURNAL - Last Signals:\n\n"
     for j in JOURNAL[-10:]:
         msg+=f"{j['time']} UTC | {j['symbol']} {j['tf']} | {j['bias'][:30]} | Price {j['price']:,.2f} | Best {j['best']} | R:R 1:{j['rr']}\n"
@@ -401,53 +401,53 @@ async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg+=f"\n✅ Good R:R setups: {fresh_count}/{len(JOURNAL)}"
     await update.message.reply_text(msg, reply_markup=main_keyboard())
 
-# --- BUTTON HANDLER ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    # Prevent double tap ghost messages
+    if query.id in PROCESSED:
+        await query.answer("Already processing...")
+        return
+    PROCESSED.add(query.id)
+    if len(PROCESSED)>100: PROCESSED.clear()
     await query.answer()
     uid = query.from_user.id
     data = query.data
     current_symbol = USER_STATE.get(uid, "GOLD")
-
-    if data.startswith("sym:"):
-        symbol = data.split(":")[1]
-        USER_STATE[uid] = symbol
-        # Show buttons again, with confirmation - buttons stay together
-        await query.edit_message_text(
-            f"✅ Selected {symbol}\nNow pick a timeframe below 👇",
-            reply_markup=main_keyboard(symbol)
-        )
-        return
-
-    if data.startswith("tf:"):
-        tf = data.split(":")[1]
-        symbol = current_symbol
-        await query.edit_message_text(f"🧠 Pro thinking about {symbol} on {tf.upper()}... please wait")
-        if tf == "all":
-            text = get_confluence(symbol)
-        else:
-            text = build_analysis(symbol, tf)
-        # Send result WITH buttons together again
-        await context.bot.send_message(chat_id=uid, text=text, reply_markup=main_keyboard(symbol))
-        return
-
-    if data == "action:score":
-        if not JOURNAL:
-            await context.bot.send_message(chat_id=uid, text="No trades logged yet.", reply_markup=main_keyboard(current_symbol))
+    try:
+        if data.startswith("sym:"):
+            symbol = data.split(":")[1]
+            USER_STATE[uid] = symbol
+            await query.edit_message_text(f"✅ Selected {symbol}\nNow pick a timeframe below 👇", reply_markup=main_keyboard(symbol))
             return
-        msg="📓 JOURNAL:\n\n"
-        for j in JOURNAL[-10:]:
-            msg+=f"{j['time']} | {j['symbol']} {j['tf']} | {j['bias'][:30]} | {j['price']:,.2f} | R:R 1:{j['rr']}\n"
-        await context.bot.send_message(chat_id=uid, text=msg, reply_markup=main_keyboard(current_symbol))
-        return
-
-    if data == "action:alert_help":
-        await context.bot.send_message(chat_id=uid, text=f"To set alert, type:\n/alert {current_symbol} 3511\n\nExample: /alert GOLD 3511", reply_markup=main_keyboard(current_symbol))
-        return
-
-    if data == "action:refresh":
-        await context.bot.send_message(chat_id=uid, text=build_analysis(current_symbol, "1h"), reply_markup=main_keyboard(current_symbol))
-        return
+        if data.startswith("tf:"):
+            tf = data.split(":")[1]
+            symbol = current_symbol
+            await query.edit_message_text(f"🧠 Pro thinking about {symbol} on {tf.upper()}... please wait")
+            if tf == "all":
+                text = get_confluence(symbol)
+            else:
+                text = build_analysis(symbol, tf)
+            await context.bot.send_message(chat_id=uid, text=text, reply_markup=main_keyboard(symbol))
+            return
+        if data == "action:score":
+            # Call score logic directly, no zone analysis
+            if not JOURNAL:
+                await context.bot.send_message(chat_id=uid, text="📓 No trades logged yet. Tap GOLD -> 1h first.", reply_markup=main_keyboard(current_symbol))
+                return
+            msg="📓 JOURNAL:\n\n"
+            for j in JOURNAL[-10:]:
+                msg+=f"{j['time']} | {j['symbol']} {j['tf']} | {j['bias'][:30]} | {j['price']:,.2f} | R:R 1:{j['rr']}\n"
+            await context.bot.send_message(chat_id=uid, text=msg, reply_markup=main_keyboard(current_symbol))
+            return
+        if data == "action:alert_help":
+            await context.bot.send_message(chat_id=uid, text=f"To set alert, type:\n/alert {current_symbol} 3511\n\nExample: /alert GOLD 3511", reply_markup=main_keyboard(current_symbol))
+            return
+        if data == "action:refresh":
+            await context.bot.send_message(chat_id=uid, text=build_analysis(current_symbol, "1h"), reply_markup=main_keyboard(current_symbol))
+            return
+    except Exception as e:
+        # If edit fails because message already edited, just send new message
+        await context.bot.send_message(chat_id=uid, text=f"Tap again 👇", reply_markup=main_keyboard(current_symbol))
 
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
     for uid, lst in list(ALERTS.items()):
@@ -461,7 +461,7 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
                 df=normalize_df(df)
                 cur=float(df["close"].iloc[-1])
                 if abs(cur-a['price'])/a['price'] < 0.002:
-                    await context.bot.send_message(chat_id=uid, text=f"🚨 ALERT! {a['symbol']} just hit {a['price']:,.2f} (Now {cur:,.2f})\nCheck your zone!", reply_markup=main_keyboard(a['symbol']))
+                    await context.bot.send_message(chat_id=uid, text=f"🚨 ALERT! {a['symbol']} just hit {a['price']:,.2f} (Now {cur:,.2f})", reply_markup=main_keyboard(a['symbol']))
                 else:
                     remaining.append(a)
             except:
@@ -471,7 +471,7 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         print("ERROR: BOT_TOKEN not set!"); return
-    print("Bot is running PRO + Buttons...")
+    print("Bot is running FINAL...")
     app_bot=ApplicationBuilder().token(BOT_TOKEN).build()
     app_bot.add_handler(CommandHandler("start", start))
     app_bot.add_handler(CommandHandler("zones", zones_cmd))
