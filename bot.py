@@ -57,7 +57,7 @@ class FVG:
     index: int
 
 ALERTS: Dict[int, List[dict]] = {}
-JOURNAL: List[dict] = {}
+JOURNAL: List[dict] = []
 USER_STATE: Dict[int, str] = {}
 
 SYMBOLS = {
